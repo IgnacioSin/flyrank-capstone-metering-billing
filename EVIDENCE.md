@@ -295,7 +295,63 @@ float on the way — see `app/services/cost.py`.
 
 ### Monthly usage rolls up into a cost figure per tenant
 
-Pending — `GET /usage`.
+Two requests with deliberately symmetric token counts — 1,000 tokens in each
+of the four categories, split across two calls:
+
+```bash
+curl -s -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" -H "X-Tenant-Id: $TENANT" \
+  -H "Idempotency-Key: roll-1" \
+  -d '{"input_tokens":1000,"output_tokens":1000}' > /dev/null
+
+curl -s -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" -H "X-Tenant-Id: $TENANT" \
+  -H "Idempotency-Key: roll-2" \
+  -d '{"cached_input_tokens":1000,"reasoning_tokens":1000}' > /dev/null
+
+curl -s http://localhost:8000/usage -H "X-Tenant-Id: $TENANT"
+```
+
+```text
+{"tenant_id":"37e4cb17-1ecc-4af4-8eaf-5e0a450902fd","plan":"free",
+"period_start":"2026-09-01T00:00:00+00:00",
+"usage":{"api_calls":{"used":2,"limit":1000,"remaining":998},
+"tokens":{"used":4000,"limit":100000,"remaining":96000}},
+"breakdown":{"api_calls":2,"input_tokens":1000,"cached_input_tokens":1000,
+"output_tokens":1000,"reasoning_tokens":1000},
+"cost_uusd":16850,"cost_usd":"$0.016850"}
+```
+
+Verified by hand against the pinned rates:
+
+| Metric | Quantity | Rate | Contribution (µUSD) |
+| --- | --- | --- | --- |
+| `input_tokens` | 1,000 | 1,500,000 / 1M | 1,500 |
+| `cached_input_tokens` | 1,000 | 150,000 / 1M | 150 |
+| `output_tokens` | 1,000 | 7,500,000 / 1M | 7,500 |
+| `reasoning_tokens` | 1,000 | 7,500,000 / 1M | 7,500 |
+| `api_calls` | 2 | 100 µUSD / call | 200 |
+| **Total** | | | **16,850** |
+
+The token counts are equal on purpose. 4,000 tokens split evenly across the
+four categories cost 16,650 µUSD; the same 4,000 tokens priced as a single
+undifferentiated quantity would cost anything from 600 to 30,000 depending
+on which rate was chosen. The categories are never summed before pricing —
+each is multiplied by its own rate, and only the results are added.
+
+The `breakdown` block is in the response so this check can be repeated
+against any period without reading the database.
+
+### Cost is frozen at the moment of the event
+
+`usage_events.cost_uusd` stores what each event was billed at, and the
+rollup sums that column rather than repricing from current constants. A
+rollup for a closed period therefore does not change when a rate does — an
+invoice issued last month cannot rewrite itself.
+
+The column was added in a second migration rather than read out of the
+`response_body` JSONB, because a billing record should not be coupled to the
+shape of an HTTP response.
 
 ---
 
@@ -397,6 +453,16 @@ Three things in that output are load-bearing:
 - `ON DELETE CASCADE` on both foreign keys means a removed tenant cannot
   leave orphaned events, and a removed event cannot leave orphaned metric
   rows that would still be summed.
+
+The schema evolved across two migrations rather than one: the initial
+metering schema, then `add cost_uusd to usage_events`. The second one uses
+`server_default="0"` so it can apply to a table that already holds rows — a
+`NOT NULL` column with no default fails on any non-empty table, which in
+production is every table.
+
+```bash
+alembic current
+```
 
 ### #5 — Idempotency where it matters
 

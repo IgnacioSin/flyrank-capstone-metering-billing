@@ -25,5 +25,11 @@ def lock_tenant(session: Session, tenant_id: uuid.UUID) -> Tenant | None:
     )
 
 
+def get(session: Session, tenant_id: uuid.UUID) -> Tenant | None:
+    """Read without locking. The rollup only reads; it never decides whether
+    a write fits, so it has no reason to serialize anyone."""
+    return session.get(Tenant, tenant_id)
+
+
 def get_plan(session: Session, code: str) -> Plan | None:
     return session.get(Plan, code)

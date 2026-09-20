@@ -81,6 +81,12 @@ class UsageEvent(Base):
     # would report a different `remaining` if other usage landed in between.
     response_body: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
+    # The cost this event was billed at, frozen. Recomputing a rollup from
+    # current rates would rewrite the price of a month that already closed.
+    cost_uusd: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default="0"
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

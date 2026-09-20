@@ -117,6 +117,7 @@ def record(
         kind=kind,
         request_hash=request_hash,
         response_body=response,
+        cost_uusd=cost_uusd,
         metrics=metrics,
     )
 

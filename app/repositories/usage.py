@@ -19,6 +19,7 @@ def insert_event_if_new(
     kind: str,
     request_hash: str,
     response_body: dict,
+    cost_uusd: int,
     metrics: dict[str, int],
 ) -> uuid.UUID | None:
     """Insert one usage event with its metrics, or report a duplicate.
@@ -45,6 +46,7 @@ def insert_event_if_new(
             kind=kind,
             request_hash=request_hash,
             response_body=response_body,
+            cost_uusd=cost_uusd,
         )
         .on_conflict_do_nothing(constraint="uq_usage_events_tenant_key")
         .returning(UsageEvent.id)
@@ -95,3 +97,20 @@ def usage_since(
         .group_by(UsageEventItem.metric)
     ).all()
     return {metric: int(total) for metric, total in rows}
+
+
+def cost_since(
+    session: Session, *, tenant_id: uuid.UUID, since: datetime
+) -> int:
+    """Total billed cost in micro-USD for this tenant since `since`.
+
+    Sums the cost each event was billed at rather than repricing from current
+    rates, so a closed period does not change when a constant does.
+    """
+    total = session.scalar(
+        select(func.coalesce(func.sum(UsageEvent.cost_uusd), 0)).where(
+            UsageEvent.tenant_id == tenant_id,
+            UsageEvent.created_at >= since,
+        )
+    )
+    return int(total or 0)

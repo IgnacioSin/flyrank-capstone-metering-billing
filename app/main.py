@@ -4,11 +4,12 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.routers import generate
+from app.routers import generate, usage
 
 app = FastAPI(title="Usage Metering & Billing Engine")
 
 app.include_router(generate.router)
+app.include_router(usage.router)
 
 
 @app.exception_handler(RequestValidationError)
