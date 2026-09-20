@@ -1,8 +1,9 @@
 """Data access for usage events. The only layer that writes SQL."""
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -74,3 +75,23 @@ def get_event_by_key(
             UsageEvent.idempotency_key == idempotency_key,
         )
     )
+
+
+def usage_since(
+    session: Session, *, tenant_id: uuid.UUID, since: datetime
+) -> dict[str, int]:
+    """Quantity per metric for this tenant since `since`.
+
+    This is the query ix_usage_events_tenant_created exists for: it filters
+    on exactly (tenant_id, created_at).
+    """
+    rows = session.execute(
+        select(UsageEventItem.metric, func.sum(UsageEventItem.quantity))
+        .join(UsageEvent, UsageEvent.id == UsageEventItem.event_id)
+        .where(
+            UsageEvent.tenant_id == tenant_id,
+            UsageEvent.created_at >= since,
+        )
+        .group_by(UsageEventItem.metric)
+    ).all()
+    return {metric: int(total) for metric, total in rows}
