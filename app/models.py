@@ -139,3 +139,66 @@ class UsageEventItem(Base):
             name="ck_usage_event_items_metric",
         ),
     )
+
+
+class Subscription(Base):
+    """Mirror of a Stripe subscription. Written only by verified webhooks.
+
+    Payment truth lives at Stripe. This table exists so the API can answer
+    quota questions without a network call, never as an independent record
+    of what a customer bought.
+    """
+
+    __tablename__ = "subscriptions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    plan_code: Mapped[str] = mapped_column(ForeignKey("plans.code"), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    stripe_customer_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    stripe_subscription_id: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True
+    )
+    current_period_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    current_period_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class ProcessedWebhookEvent(Base):
+    """One row per Stripe event id, ever.
+
+    Stripe delivers at least once: a slow response, a network blip, or a
+    manual replay all produce the same event twice. The primary key is the
+    dedup — the same INSERT ... ON CONFLICT DO NOTHING that protects the
+    metering path, on a different table.
+    """
+
+    __tablename__ = "processed_webhook_events"
+
+    stripe_event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # The raw event, stored so the job reads from the database rather than
+    # from the queue message, and so a billing decision can always be traced
+    # back to the exact event it was made on.
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="received")
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    

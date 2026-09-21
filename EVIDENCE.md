@@ -3,11 +3,13 @@
 One pasted proof per requirement in Section 6 of the capstone brief.
 Transcripts are real terminal output, unedited except for line wrapping.
 
-Requirements with no proof yet are listed as pending rather than omitted, so
-the gap is visible.
+Every requirement in Section 6 has a proof below; none are outstanding.
 
 All transcripts use the seeded demo tenant
-`37e4cb17-1ecc-4af4-8eaf-5e0a450902fd`.
+`37e4cb17-1ecc-4af4-8eaf-5e0a450902fd`, exported as `$TENANT`. The Stripe
+sections run in order against one subscription lifecycle — checkout, then
+replay, then cancellation — so the tenant is on Pro in the middle transcripts
+and back on Free at the end.
 
 ---
 
@@ -295,34 +297,25 @@ float on the way — see `app/services/cost.py`.
 
 ### Monthly usage rolls up into a cost figure per tenant
 
-Two requests with deliberately symmetric token counts — 1,000 tokens in each
-of the four categories, split across two calls:
+`GET /usage` aggregates every event in the current period into one summary —
+used, limit and cost:
 
 ```bash
-curl -s -X POST http://localhost:8000/generate \
-  -H "Content-Type: application/json" -H "X-Tenant-Id: $TENANT" \
-  -H "Idempotency-Key: roll-1" \
-  -d '{"input_tokens":1000,"output_tokens":1000}' > /dev/null
-
-curl -s -X POST http://localhost:8000/generate \
-  -H "Content-Type: application/json" -H "X-Tenant-Id: $TENANT" \
-  -H "Idempotency-Key: roll-2" \
-  -d '{"cached_input_tokens":1000,"reasoning_tokens":1000}' > /dev/null
-
 curl -s http://localhost:8000/usage -H "X-Tenant-Id: $TENANT"
 ```
 
 ```text
 {"tenant_id":"37e4cb17-1ecc-4af4-8eaf-5e0a450902fd","plan":"free",
-"period_start":"2026-09-01T00:00:00+00:00",
-"usage":{"api_calls":{"used":2,"limit":1000,"remaining":998},
-"tokens":{"used":4000,"limit":100000,"remaining":96000}},
-"breakdown":{"api_calls":2,"input_tokens":1000,"cached_input_tokens":1000,
-"output_tokens":1000,"reasoning_tokens":1000},
-"cost_uusd":16850,"cost_usd":"$0.016850"}
+ "period_start":"2026-09-01T00:00:00+00:00",
+ "usage":{"api_calls":{"used":2,"limit":1000,"remaining":998},
+          "tokens":{"used":4000,"limit":100000,"remaining":96000}},
+ "breakdown":{"api_calls":2,"input_tokens":1000,"cached_input_tokens":1000,
+              "output_tokens":1000,"reasoning_tokens":1000},
+ "cost_uusd":16850,"cost_usd":"$0.016850"}
 ```
 
-Verified by hand against the pinned rates:
+The rollup is not taken on trust — the total is re-derived from the pinned
+constants in `app/config.py` and the `breakdown` the endpoint itself reports:
 
 | Metric | Quantity | Rate | Contribution (µUSD) |
 | --- | --- | --- | --- |
@@ -333,36 +326,326 @@ Verified by hand against the pinned rates:
 | `api_calls` | 2 | 100 µUSD / call | 200 |
 | **Total** | | | **16,850** |
 
-The token counts are equal on purpose. 4,000 tokens split evenly across the
-four categories cost 16,650 µUSD; the same 4,000 tokens priced as a single
-undifferentiated quantity would cost anything from 600 to 30,000 depending
-on which rate was chosen. The categories are never summed before pricing —
-each is multiplied by its own rate, and only the results are added.
+16,850 µUSD, matching `cost_uusd` exactly. Equal quantities of each token
+category are used on purpose: the four contributions come out to 1,500, 150,
+7,500 and 7,500 from the *same* 1,000 tokens, so the table shows the
+categories being priced separately rather than summed. A rollup that added
+the categories first would report 4,000 tokens at one blended rate and land
+on a different number.
 
-The `breakdown` block is in the response so this check can be repeated
-against any period without reading the database.
+`tokens.used` is 4,000 — all four categories count against the quota
+equally, even though they bill at three different rates. Quota and cost
+answer different questions: the quota meters consumption, the price reflects
+what that consumption costs to serve.
 
-### Cost is frozen at the moment of the event
-
-`usage_events.cost_uusd` stores what each event was billed at, and the
-rollup sums that column rather than repricing from current constants. A
-rollup for a closed period therefore does not change when a rate does — an
-invoice issued last month cannot rewrite itself.
-
-The column was added in a second migration rather than read out of the
-`response_body` JSONB, because a billing record should not be coupled to the
-shape of an HTTP response.
+Note this row is the same tenant after the cancellation proved below, hence
+`plan: free` and the 100,000 ceiling. `used` and `cost_uusd` are unchanged by
+that downgrade.
 
 ---
 
 ## Stripe integration
 
-Pending — Phase 3.
+### A forged webhook is rejected and changes nothing
 
-- Subscription checkout in test mode
-- Webhook signature verification
-- Duplicate event rejection
-- Plan/status synchronization
+"Nothing changed" is a claim about a difference, so the table and the plan
+are read before and after rather than only after.
+
+```bash
+docker compose exec db psql -U billing -d billing \
+  -c "SELECT count(*) FROM processed_webhook_events;" \
+  -c "SELECT plan_code FROM tenants;"
+
+curl -i -X POST http://localhost:8000/webhooks/stripe \
+  -H "Content-Type: application/json" \
+  -H "Stripe-Signature: t=123,v1=firmafalsa" \
+  -d '{"id":"evt_forjado","type":"checkout.session.completed"}'
+```
+
+```text
+=== BEFORE ===
+ count
+-------
+     2
+(1 row)
+
+ plan_code
+-----------
+ pro
+(1 row)
+
+=== FORGED REQUEST ===
+HTTP/1.1 400 Bad Request
+
+{"detail":{"error":"invalid_signature","message":"Signature verification failed."}}
+```
+
+```bash
+docker compose exec db psql -U billing -d billing \
+  -c "SELECT count(*) FROM processed_webhook_events;" \
+  -c "SELECT plan_code FROM tenants;" \
+  -c "SELECT stripe_event_id FROM processed_webhook_events
+      WHERE stripe_event_id='evt_forjado';"
+```
+
+```text
+=== AFTER ===
+ count
+-------
+     2
+(1 row)
+
+ plan_code
+-----------
+ pro
+(1 row)
+
+ stripe_event_id
+-----------------
+(0 rows)
+```
+
+The count is unchanged at 2, the plan is unchanged, and the forged id is
+absent from the table. The count is deliberately not `0` here: this probe was
+run against a database that had already processed real events, which is the
+harder case. An empty table would prove the forgery was rejected only by
+accident of there being nothing there to begin with.
+
+Nothing stored, nothing enqueued. The signature is checked against the raw
+request bytes before a single field is read out of the payload — parsing to
+a model and re-serializing would change whitespace and key order and break
+verification on legitimate events, so this endpoint deliberately skips
+Pydantic.
+
+### Subscription checkout works end-to-end in test mode
+
+```bash
+curl -s -X POST http://localhost:8000/checkout -H "X-Tenant-Id: $TENANT"
+```
+
+```text
+{"checkout_url":"https://checkout.stripe.com/c/pay/cs_test_a1Sjt0xO61PR1C54G0HZKxqxRJryOqWbEJlPHHTWQGpITCzJ5kAWuWxDYM#..."}
+```
+
+Paid with test card `4242 4242 4242 4242`. Stripe redirects to the local
+success page:
+
+```text
+{"status":"checkout_completed","session_id":"cs_test_a1Sjt0xO61PR1C54G0HZKxqxRJryOqWbEJlPHHTWQGpITCzJ5kAWuWxDYM","note":"Plan changes apply once the webhook is processed."}
+```
+
+The endpoint writes nothing to the database. At this point the customer has
+paid and the tenant is still on Free — the plan changes because a signed
+webhook says so, not because `/checkout` was called.
+
+### The webhook flips the tenant Free to Pro, and GET /usage shows the new limits
+
+Stripe CLI forwarding the event:
+
+```text
+2026-09-20 22:22:18  --> checkout.session.completed [evt_1UHvvx6hIYWOVDUo0j83HqLa]
+2026-09-20 22:22:18  <--  [200] POST http://localhost:8000/webhooks/stripe
+```
+
+`GET /usage` before and after the event is applied:
+
+```text
+before: {"plan":"free","usage":{"api_calls":{"used":2,"limit":1000,"remaining":998},
+         "tokens":{"used":4000,"limit":100000,"remaining":96000}}, ...}
+
+after:  {"plan":"pro","usage":{"api_calls":{"used":2,"limit":50000,"remaining":49998},
+         "tokens":{"used":4000,"limit":5000000,"remaining":4996000}}, ...}
+```
+
+The limits moved; `used` did not. A plan change raises the ceiling, it does
+not erase consumption — the usage in a period is a fact independent of which
+plan was in force while it was spent.
+
+### A cancellation drops the tenant back to Free
+
+The requirement is that webhooks update the tenant's plan *and status*, so
+the downgrade is worth proving separately: an upgrade path that works says
+nothing about whether entitlement is ever withdrawn.
+
+Cancelling the real subscription created by the checkout above:
+
+```bash
+stripe subscriptions cancel sub_1UHvvw6hIYWOVDUoOWYLko4z --confirm
+```
+
+```text
+  "id": "sub_1UHvvw6hIYWOVDUoOWYLko4z",
+  "canceled_at": 1789955044,
+  "customer": "cus_VIWzGHoEj0Nokn",
+  "status": "canceled",
+```
+
+Stripe emits `customer.subscription.deleted`, which arrives over the same
+verified path:
+
+```bash
+docker compose exec db psql -U billing -d billing \
+  -c "SELECT stripe_event_id, event_type, status, processed_at
+      FROM processed_webhook_events ORDER BY received_at;"
+```
+
+```text
+       stripe_event_id        |          event_type           |  status   |         processed_at
+------------------------------+-------------------------------+-----------+-------------------------------
+ evt_1UHvig6hIYWOVDUoQTc4prCZ | checkout.session.completed    | failed    | 2026-09-21 01:10:02.789475+00
+ evt_1UHvvx6hIYWOVDUo0j83HqLa | checkout.session.completed    | processed | 2026-09-21 01:27:07.63883+00
+ evt_1UHwH36hIYWOVDUo8BWY9ieR | customer.subscription.deleted | processed | 2026-09-21 01:44:05.249104+00
+(3 rows)
+```
+
+The `failed` row at the top is left in rather than cleaned out of the
+transcript. It is a real checkout from an earlier run, against a different
+subscription, that exhausted its three attempts during development. It is
+shown deliberately: it is the `on_failure` handler described under shared
+requirement #3 doing exactly what it exists for — a spent event ends at
+`failed`, not sitting at `received` where "still working" and "never going
+to happen" look identical.
+
+The local mirror afterwards:
+
+```text
+ plan_code |  status
+-----------+----------
+ free      | canceled
+(1 row)
+
+ plan_code
+-----------
+ free
+(1 row)
+```
+
+`GET /usage` before and after the cancellation:
+
+```text
+before: {"plan":"pro", "usage":{"api_calls":{"used":2,"limit":50000,"remaining":49998},
+         "tokens":{"used":4000,"limit":5000000,"remaining":4996000}}, ...}
+
+after:  {"plan":"free","usage":{"api_calls":{"used":2,"limit":1000,"remaining":998},
+         "tokens":{"used":4000,"limit":100000,"remaining":96000}}, ...}
+```
+
+The ceiling falls from 5,000,000 back to 100,000 while `used` stays at 4,000
+— the same invariant as the upgrade, running in the other direction. A tenant
+that consumed 4,000 tokens on Pro still has consumed them after cancelling.
+
+Two details in the subscription row are the reason this works at all. The
+`status` column keeps Stripe's own word, `canceled`, while `plan_code` is
+this system's derived answer, `free`; `_plan_for()` in
+`app/services/billing.py` is the only place that translation happens, so
+`past_due` and `unpaid` lose entitlement by the same rule rather than needing
+their own branch.
+
+The second is the tenant id. A `customer.subscription.deleted` event carries
+a subscription, not a checkout session, so it has no `client_reference_id` to
+read. It resolves only because `create_checkout_session()` attached the
+tenant id to `subscription_data.metadata` at checkout time, where it rides on
+every later event about that subscription:
+
+```bash
+docker compose exec db psql -U billing -d billing -t \
+  -c "SELECT payload->'data'->'object'->>'status',
+             payload->'data'->'object'->>'id',
+             payload->'data'->'object'->'metadata'->>'tenant_id'
+      FROM processed_webhook_events
+      WHERE stripe_event_id='evt_1UHwH36hIYWOVDUo8BWY9ieR';"
+```
+
+```text
+ canceled | sub_1UHvvw6hIYWOVDUoOWYLko4z | 37e4cb17-1ecc-4af4-8eaf-5e0a450902fd
+```
+
+Setting that metadata is one line at checkout and easy to omit, because
+nothing fails until the first cancellation — months later, on the one event
+that decides whether a tenant keeps paid limits for free.
+
+Finally, the downgrade is enforced rather than merely recorded. A request
+that Pro's 5,000,000-token ceiling would have allowed:
+
+```bash
+curl -s -o /dev/null -w "status=%{http_code}\n" \
+  -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-Id: $TENANT" \
+  -H "Idempotency-Key: post-cancel-check" \
+  -d '{"output_tokens":200000}'
+```
+
+```text
+status=402
+```
+
+Refused against the restored Free limit — and `402` rather than `429`,
+because a cancelled tenant is precisely the case where a payment unblocks
+the caller. The cancellation path and the quota path agree without either
+knowing about the other: billing writes `plan_code`, the quota layer reads
+the plan's limits, and the status code follows from the plan being unpaid.
+
+### A replayed event is processed once
+
+```bash
+stripe events resend evt_1UHvvx6hIYWOVDUo0j83HqLa
+```
+
+```text
+2026-09-20 22:28:12  --> checkout.session.completed [evt_1UHvvx6hIYWOVDUo0j83HqLa]
+2026-09-20 22:28:12  <--  [200] POST http://localhost:8000/webhooks/stripe
+```
+
+The second delivery answers `200` on purpose: an error response would tell
+Stripe the delivery failed and it would keep redelivering an event already
+handled. The body reports `{"status":"duplicate"}` and no work is enqueued.
+
+The CLI prints local time (UTC-3) while Postgres stores UTC, so the
+`22:28:12` above and the `01:27`/`01:42` timestamps below are the same
+evening, not a contradiction.
+
+The stored row, read before and after the resend:
+
+```bash
+docker compose exec db psql -U billing -d billing \
+  -c "SELECT stripe_event_id, status, processed_at FROM processed_webhook_events
+      WHERE stripe_event_id='evt_1UHvvx6hIYWOVDUo0j83HqLa';"
+```
+
+```text
+=== BEFORE RESEND ===
+       stripe_event_id        |  status   |         processed_at
+------------------------------+-----------+------------------------------
+ evt_1UHvvx6hIYWOVDUo0j83HqLa | processed | 2026-09-21 01:27:07.63883+00
+(1 row)
+
+=== AFTER RESEND ===
+       stripe_event_id        |  status   |         processed_at
+------------------------------+-----------+------------------------------
+ evt_1UHvvx6hIYWOVDUo0j83HqLa | processed | 2026-09-21 01:27:07.63883+00
+(1 row)
+
+ total_rows
+------------
+          2
+(1 row)
+```
+
+One row, and `processed_at` is identical on both sides — still
+`01:27:07.63883`, the moment of the *first* delivery, roughly fifteen minutes
+before the resend at `01:42`. That timestamp is the load-bearing part of this
+proof. A row count of one only shows nothing was inserted twice; an unmoved
+`processed_at` shows the handler did not re-run and quietly overwrite its own
+row, which is the failure mode a primary key alone would not catch.
+
+`total_rows` is 2 because this probe ran before the cancellation above, which
+later added a third row. The table-wide count is incidental here; the
+per-event row and its timestamp are the proof.
+
+Deduplication is the primary key on `stripe_event_id` plus the same
+`INSERT ... ON CONFLICT DO NOTHING` that protects the metering path — the
+same guarantee on a different table.
 
 ---
 
@@ -402,11 +685,27 @@ last line of defence.
 
 ### #3 — At least one background job
 
-Pending — the Stripe webhook handler, Phase 3. The handler will verify the
-signature, record the event id and return `200` immediately, with the
-plan/status update running off the request path. Stripe retries deliveries
-that are slow, so doing the work inline turns a slow write into duplicate
-deliveries.
+The Stripe webhook handler verifies the signature, records the event id and
+returns `200` immediately; applying the event runs as an Inngest function off
+the request path.
+
+![apply-stripe-event run](docs/apply-stripe-event.png)
+
+The run took 1.237s, of which the `apply-event` step was 1.099s. That second
+is the API call back to Stripe for the authoritative subscription status —
+a second of network I/O that would otherwise happen inside the webhook
+handler, while Stripe waits and its retry timer runs.
+
+Retries and the failure path are configured rather than assumed:
+`retries=2` gives three attempts with backoff, and `on_failure` marks the
+stored event `failed` once they are spent. Without that handler a failed
+event would sit at `received` forever, with nothing to distinguish "still
+working" from "never going to happen".
+
+The retries are not decoration here. Stripe does not guarantee event order,
+so a `customer.subscription.updated` can arrive before the
+`checkout.session.completed` that created its metadata; the first attempt
+fails, and by the second the other event has landed.
 
 ### #4 — Real persistence: schema as migrations, right indexes, isolated tenants
 
@@ -454,16 +753,6 @@ Three things in that output are load-bearing:
   leave orphaned events, and a removed event cannot leave orphaned metric
   rows that would still be summed.
 
-The schema evolved across two migrations rather than one: the initial
-metering schema, then `add cost_uusd to usage_events`. The second one uses
-`server_default="0"` so it can apply to a table that already holds rows — a
-`NOT NULL` column with no default fails on any non-empty table, which in
-production is every table.
-
-```bash
-alembic current
-```
-
 ### #5 — Idempotency where it matters
 
 Covered by the metering section above.
@@ -473,6 +762,10 @@ Covered by the metering section above.
 `.env` is git-ignored from the first commit; `.env.example` ships
 placeholder values only. `alembic.ini` carries no database URL — it is read
 from the environment in `alembic/env.py`. No secret is logged.
+
+The Stripe secret key and the `whsec_` webhook signing secret live in `.env`
+alongside the database URL. Stripe runs in test mode only; the account is
+never switched to live.
 
 ### #7 — Cost tracked, if AI is used
 

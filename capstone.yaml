@@ -1,2 +1,73 @@
 # Manifest read by the evaluator.
-# Filled in once there is something to run (Phase 2).
+# See README.md for the two extra processes the webhook probes need.
+
+name: usage-metering-billing-engine
+track: backend
+language: python
+framework: fastapi
+database: postgresql
+
+# Starts Postgres, applies migrations, and boots the API.
+run: docker compose up -d && alembic upgrade head && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# Creates the free/pro plans and one demo tenant. Safe to run repeatedly.
+# Prints the demo tenant's UUID, which every probe below needs.
+seed: python -m scripts.seed
+
+base_url: http://localhost:8000
+
+endpoints:
+  - method: GET
+    path: /health
+    description: Liveness check.
+
+  - method: POST
+    path: /generate
+    description: >
+      The billable action. Records usage, enforces quota, calculates cost.
+      Sending the same Idempotency-Key twice records one event and replays
+      the first response byte for byte.
+    headers:
+      X-Tenant-Id: <demo tenant UUID from the seed>
+      Idempotency-Key: <any client-chosen string>
+    body: '{"input_tokens":1000,"cached_input_tokens":500,"output_tokens":2000,"reasoning_tokens":300}'
+    responses:
+      201: usage recorded
+      200: idempotent replay of a previous identical request
+      400: missing or malformed header, or invalid token counts
+      402: quota exhausted and a payment action would unblock it
+      422: idempotency key reused with a different body
+      429: quota exhausted on a paid plan
+
+  - method: GET
+    path: /usage
+    description: >
+      Rollup for the current calendar month - used, limit and remaining per
+      quota, a per-metric breakdown, and the billed cost.
+    headers:
+      X-Tenant-Id: <demo tenant UUID from the seed>
+
+  - method: POST
+    path: /checkout
+    description: >
+      Creates a Stripe Checkout session in test mode and returns its URL.
+      Writes nothing - the plan changes only when the webhook arrives.
+    headers:
+      X-Tenant-Id: <demo tenant UUID from the seed>
+
+  - method: POST
+    path: /webhooks/stripe
+    description: >
+      Verifies the Stripe signature against the raw body, deduplicates by
+      event id, and hands the work to a background job. A bad signature
+      returns 400 and changes nothing; a replayed event returns 200 and is
+      processed once.
+    headers:
+      Stripe-Signature: <supplied by Stripe>
+
+notes: >
+  Stripe test mode only. Webhook probes need the Stripe CLI forwarding to
+  localhost and the Inngest Dev Server running - both documented in the
+  README. The Stripe CLI requires an interactive login against the
+  evaluator's own account, which is why it is not part of the run command.
+  

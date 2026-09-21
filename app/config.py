@@ -12,6 +12,17 @@ load_dotenv()
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
+# Stripe, test mode only. The brief is explicit: never switch to live.
+STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
+STRIPE_PRICE_ID_PRO = os.environ["STRIPE_PRICE_ID_PRO"]
+
+# The Stripe CLI prints a fresh whsec_ every time `stripe listen` starts, so
+# this one is read leniently and checked where it is used — a missing webhook
+# secret should fail the webhook, not the whole application.
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000")
+
 # Micro-USD per 1,000,000 tokens. Mirrors Gemini 3.6 Flash as published in
 # September 2026; pinned, not fetched.
 TOKEN_RATES_UUSD_PER_MILLION: dict[str, int] = {

@@ -4,12 +4,21 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.routers import generate, usage
+import inngest.fast_api
+
+from app.jobs import apply_stripe_event, inngest_client
+from app.routers import checkout, generate, usage, webhooks
 
 app = FastAPI(title="Usage Metering & Billing Engine")
 
 app.include_router(generate.router)
 app.include_router(usage.router)
+app.include_router(checkout.router)
+app.include_router(webhooks.router)
+
+# Declares the function at /api/inngest so the Dev Server can discover and
+# invoke it. A function missing from this list does not exist for Inngest.
+inngest.fast_api.serve(app, inngest_client, [apply_stripe_event])
 
 
 @app.exception_handler(RequestValidationError)
